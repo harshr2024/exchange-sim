@@ -30,12 +30,13 @@ market-data protocols and regulatory rules that are not here. See
 | 2 | Market orders, cancellation, snapshots, invariants, benchmarks | done |
 | 3 | Market actor, sequencing, session log, deterministic replay | done |
 | 4 | Simulated traders and terminal simulation | done |
-| 5 | HTTP order entry and WebSocket market data | not started |
+| 5 | HTTP order entry and WebSocket market data | done |
 | 6 | React + TypeScript trading screen | not started |
 | 7 | Polish and documentation | not started |
 
-The backend is complete and tested through phase 4. There is no frontend and no
-network layer yet; the exchange runs from a terminal.
+The backend is complete and tested through phase 5: the exchange serves HTTP order entry
+and a WebSocket market data feed. There is no frontend yet, so the browser-facing half is
+exercised by tests and `curl`.
 
 ---
 
@@ -130,8 +131,18 @@ go run ./cmd/session -session-dir /tmp/sessions
 # Rebuild any market from its log.
 go run ./cmd/replay -file /tmp/sessions/session-NOVA.ndjson
 
-# Boot the exchange (health endpoint and instrument listing only, so far).
+# Boot the exchange: HTTP order entry, WebSocket market data, bots running.
 go run ./cmd/exchanged
+```
+
+With the server up:
+
+```sh
+curl localhost:8080/api/markets/NOVA/snapshot
+curl -X POST localhost:8080/api/markets/NOVA/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"side":"buy","type":"limit","price":9950,"quantity":40}'
+curl -X DELETE localhost:8080/api/markets/NOVA/orders/30
 ```
 
 `cmd/session` prints the book, tape and open orders after each step:
@@ -197,6 +208,8 @@ market's own goroutine rather than by locking the book.
 | `internal/engine` | The order book and matching. Generic over symbol, no concurrency, no I/O. |
 | `internal/market` | Sequencing, validation, the session log, event publication, the actor, replay. |
 | `internal/sim` | The simulated traders and the two runners that schedule them. |
+| `internal/feed` | The market data hub: bounded subscriber queues and wire messages. |
+| `internal/api` | HTTP order entry and the WebSocket stream handler. |
 | `internal/instrument` | The listed fictional securities and tick-to-decimal formatting. |
 | `internal/display` | Plain-text rendering for the command-line tools. |
 | `cmd/exchanged` | The server. |
@@ -204,8 +217,11 @@ market's own goroutine rather than by locking the book.
 | `cmd/session` | Drives a scripted human session and verifies it replays. |
 | `cmd/replay` | Rebuilds a market from a session log. |
 
-Further reading: [`docs/order-book-internals.md`](docs/order-book-internals.md) covers
-the hybrid map-plus-heap design and the lazy stale-level scheme in detail.
+Further reading:
+- [`docs/protocol.md`](docs/protocol.md) — the HTTP and WebSocket protocol, the
+  snapshot/stream synchronisation strategy, and backpressure.
+- [`docs/order-book-internals.md`](docs/order-book-internals.md) — the hybrid map-plus-heap
+  design and the lazy stale-level scheme.
 
 ---
 
@@ -403,11 +419,56 @@ unknown-order error.
 
 ---
 
+## Network layer
+
+Full detail in [`docs/protocol.md`](docs/protocol.md). The three decisions worth stating here:
+
+**Live market data is incremental, not snapshots.** The engine records which price levels
+each command touched, so an update carries only those. Broadcasting a full snapshot per
+command would make market data cost more than the matching underneath it — 139 µs against
+~200 ns on a 2,000-level book. Snapshots stay an occasional synchronisation operation.
+Level quantities in an update are absolute rather than differences, so applying one twice is
+harmless and a client never tracks whether it already accounted for a fill.
+
+**The client is given an identity, not asked for one.** There is no authentication and
+correspondingly no client-supplied participant: the request schema has no such field and
+unknown fields are rejected, so a client attempting to name itself gets a `400` rather than
+being silently reinterpreted. Cancellation ownership is still enforced by the market, so a
+browser can cancel its own orders and nothing else.
+
+**The matching engine never waits for a socket.** Each subscriber has a bounded queue, every
+publish is a non-blocking send, and a subscriber that fills its queue is evicted rather than
+waited for. Dropping one consumer is always better than letting the slowest browser set the
+pace of the exchange.
+
+### Closing the snapshot/stream gap
+
+Fetching a snapshot and then subscribing loses every update in between — silently, which is
+the worst part. The order is inverted instead:
+
+```
+1. subscribe                    the hub queues from here on; nothing can be missed
+2. snapshot at sequence S       taken on the market's goroutine, so it covers exactly
+                                commands 1..S, whose updates are already queued
+3. send the snapshot
+4. forward the queue,           everything at or below S is already in the snapshot
+   discarding seq <= S
+5. continue live
+```
+
+Step 4 needs no catch-up phase and no boundary marker: messages leave the hub in sequence
+order, so once one passes `seq > S` every later one does, and the filter stops mattering by
+itself. If the subscriber is evicted at any point — including while the snapshot is being
+taken — messages were lost, so the server sends `resync` and closes rather than delivering
+what is on the far side of a gap.
+
+---
+
 ## Testing
 
 ```sh
 cd backend
-go test ./...              # 74 test functions, 107 cases including subtests
+go test ./...              # 117 test functions, 166 cases including subtests
 go test -race ./...        # the same suite under the race detector
 go test ./internal/engine/ -run '^$' -bench . -benchmem
 ```
@@ -490,6 +551,23 @@ rather than crossing, that it replaces depleted quotes but leaves healthy ones a
 that the noise trader never fires a market order into an empty book, and that identically
 seeded bots fed identical views decide identically.
 
+**Network layer.** HTTP submission of limit and market orders, multi-level sweeps through
+the API, participant-pinned cancellation ownership (403 for another participant, 404 for an
+order that is gone), refusal of a client-supplied participant, every malformed request shape,
+unknown symbols and order IDs, oversized bodies, and market isolation.
+
+**Market data.** That a stream opens with a snapshot and then carries only deltas; that
+trades, level changes and quotes arrive; that a subscriber sees only its own order lifecycle;
+that everything after the snapshot is strictly newer than it while the market is under
+continuous load; that a client which stops reading is evicted and told to resync while the
+market keeps sequencing at full speed and the others lose nothing; and that disconnecting
+releases the subscription rather than leaking one per connection.
+
+A separate test applies every streamed level change to an empty view and checks it
+reconstructs exactly what the REST snapshot reports, which is the property the whole
+incremental feed rests on: if it held only for simple cases the feed would drift over a long
+session without any single update looking wrong.
+
 **Concurrency.** Sixteen goroutines submit 4,000 commands into one market actor. The
 test asserts that sequence numbers form the dense range `1..N` with no gaps and no
 duplicates, that each goroutine's own submissions are monotonic, that all invariants
@@ -540,26 +618,34 @@ read best bid and best ask             9.9 ns       9.9 ns        9.8 ns
   whole lazy stale-level scheme exists to protect. If this ever grew with depth, it
   would mean drained levels were accumulating faster than they are reclaimed.
 
-### The one that does not scale
+### Market data: snapshots against deltas
 
-Publishing depth costs more than matching does, and superlinearly in the number of
-distinct prices:
+Publishing a full snapshot costs more than matching does, and superlinearly in the number of
+distinct prices. Publishing only what changed does not:
 
 ```
-                        20 levels   200 levels   2000 levels
-snapshot top 10/side      507 ns      6.4 µs       133 µs
+                             20 levels   200 levels   2000 levels
+full snapshot, top 10/side      537 ns      6.5 µs       139 µs
+incremental update              300 ns      274 ns       325 ns
 ```
 
-`Snapshot` collects every live level, sorts them, then keeps ten. That is O(L log L)
-per call, and a `book_changed` event fires on **every command**, so at 2,000 distinct
-prices market data would cost roughly 600× what the matching underneath it costs.
+`Snapshot` collects every live level, sorts them and keeps ten, which is O(L log L). Since a
+market data event fires on every command, broadcasting snapshots would have made the feed cost
+roughly 600× the matching beneath it on a deep book. The incremental path is flat in the size
+of the book because the engine records which levels a command touched and reports only those.
+(The update figures include the two order submissions that produced the change, so collecting
+the delta is cheaper still.)
 
-It is not a current problem — the running simulation holds a few dozen levels, where a
-snapshot is around 1 µs — but it is a real scaling cliff and the strongest argument
-against the map-plus-heap choice. The fixes, in increasing order of effort: select the
-top ten instead of sorting all of them; publish deltas rather than full snapshots;
-or maintain the book in an ordered structure where traversal is already cheap. This is
-work for the network-layer phase, not something to guess at now.
+This is why deltas are the live path and snapshots are used once per connection. The book's
+data structures were not changed for it; top-K selection instead of a full sort would cut the
+snapshot cost independently, if books with thousands of levels ever became a real workload.
+
+Getting the flat line above required fixing a bug that the benchmark itself exposed. Clearing
+a Go map costs its bucket count rather than its key count, and a map never returns capacity,
+so one order sweeping hundreds of levels left an inflated touched-set behind and every
+subsequent one-level command paid to walk all of it — a transient burst permanently taxing the
+steady state. At 2,000 levels the delta cost 1,119 ns before the fix and 325 ns after.
+`TestTouchedSetIsNotRetainedAfterALargeSweep` is the regression test.
 
 ### Self-contained units
 
@@ -624,9 +710,17 @@ Not oversights — decisions:
 - **Trade history is unbounded.** A market keeps every trade of its session in memory
   so replay can be verified against the whole history. Fine for a demo, not for a
   long-running process.
-- **`book_changed` carries a full snapshot**, not a delta, and building one is
-  superlinear in the number of distinct prices. See the benchmark section: this is the
-  clearest scaling weakness in the current design.
+- **No market data gap recovery.** A client that falls behind is told to resync and refetch;
+  there is no message replay, sequence-range request or incremental catch-up. Simpler and
+  cannot be subtly wrong for one user, but a real feed would want snapshot sequencing.
+- **Snapshot generation is superlinear** in distinct price levels. It is no longer on the
+  live path, but it is still paid per WebSocket connection and per REST call, so a book with
+  thousands of levels would make reconnection expensive. Top-K selection instead of a full
+  sort would fix it without touching the book's data structures.
+- **No execution reports for passive fills.** When a bot fills the human's resting order, no
+  order message is emitted for the human: the engine reports lifecycle events for the
+  incoming order only. A client can detect it from the order IDs in the streamed trades, or
+  refetch its open orders. A real venue would send both sides an execution report.
 - **No self-trade prevention.** The market maker avoids matching its own quotes by never
   crossing, but nothing in the engine would stop it.
 - **The bots are not a market model.** They generate plausible-looking activity. Nothing
@@ -638,6 +732,9 @@ Not oversights — decisions:
 
 Roughly in order of value, and only after the MVP is polished:
 
+0. **The trading screen** (phase 6) — one React/TypeScript page: live book, tape, price
+   chart, order entry, open orders. The protocol it needs already exists.
+
 1. **Accounts and risk checks** — virtual cash, positions, reserved cash and
    inventory, pre-trade buying-power validation, no naked shorting. Brings its own
    invariants: cash and shares are conserved, available balances never go negative.
@@ -648,8 +745,9 @@ Roughly in order of value, and only after the MVP is polished:
 4. **IOC and FOK** — FOK is interesting because it has to determine whether enough
    eligible liquidity exists *before* mutating the book.
 5. **Self-trade prevention.**
-6. **Market-data recovery** — snapshot sequencing, incremental deltas, gap detection,
-   catch-up on reconnect.
+6. **Market-data recovery** — snapshot sequencing, gap detection and catch-up on reconnect,
+   rather than the current refetch-and-resubscribe. Also execution reports to the passive side
+   of a fill.
 7. **More sophisticated traders** — momentum, mean reversion, inventory-aware
    quoting. Still no ML.
 8. **Latency simulation** — model participant, gateway and exchange latency, then

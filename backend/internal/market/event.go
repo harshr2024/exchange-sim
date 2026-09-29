@@ -31,10 +31,14 @@ type Event struct {
 	// several trades and change the book.
 	Sequence uint64 `json:"sequence"`
 
-	Order  *engine.View         `json:"order,omitempty"`
-	Trade  *engine.Trade        `json:"trade,omitempty"`
-	Book   *engine.BookSnapshot `json:"book,omitempty"`
-	Reason string               `json:"reason,omitempty"`
+	Order *engine.View  `json:"order,omitempty"`
+	Trade *engine.Trade `json:"trade,omitempty"`
+	// Update is set on BookChanged and carries the command's incremental market data.
+	// It is a delta, not a snapshot: rebuilding published depth costs more than the
+	// matching underneath it once a book is deep, so snapshots stay an occasional
+	// synchronisation operation and this is the live path.
+	Update *Update `json:"update,omitempty"`
+	Reason string  `json:"reason,omitempty"`
 }
 
 // Sink receives market data events from the market goroutine.

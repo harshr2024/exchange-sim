@@ -68,6 +68,9 @@ func (b *Book) match(o *Order) []Trade {
 			o.fill(qty)
 			resting.fill(qty)
 			lvl.reduce(qty)
+			// A partial fill changes the level's advertised quantity without removing
+			// anything, so it has to be recorded for market data explicitly.
+			opp.touch(lvl.Price)
 
 			if resting.RemainingQty == 0 {
 				opp.remove(lvl, n)

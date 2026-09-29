@@ -140,6 +140,38 @@ func BenchmarkSteadyStateBestPrice(b *testing.B) {
 	}
 }
 
+// BenchmarkSteadyStateLevelChanges measures the incremental alternative to a snapshot:
+// collecting the levels one command actually touched.
+//
+// Compare against BenchmarkSteadyStateSnapshot at the same level counts. A snapshot has to
+// gather and sort every level on the book to publish the top ten, so it grows with the size
+// of the book; this grows with the size of the change, which is why the live feed publishes
+// deltas and keeps snapshots for synchronisation only.
+func BenchmarkSteadyStateLevelChanges(b *testing.B) {
+	for _, levels := range []int{20, 200, 2_000} {
+		b.Run(fmt.Sprintf("levels=%d", levels), func(b *testing.B) {
+			book := NewBook("BENCH")
+			var bld builder
+			seedBook(book, &bld, levels*5, levels)
+			book.DiscardLevelChanges()
+
+			const touch = PriceTicks(10000)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				// One resting order plus the fill that takes it: two touched levels,
+				// whatever the size of the surrounding book.
+				book.Submit(bld.limit(Sell, touch, 10))
+				book.Submit(bld.limit(Buy, touch, 10))
+				if got := len(book.TakeLevelChanges()); got == 0 {
+					b.Fatal("no level changes recorded")
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkSteadyStateSnapshot measures publishing the top ten levels per side,
 // which is what every market data update costs. It sorts the live levels rather than
 // reading the heap's internal order, so its cost tracks the number of distinct

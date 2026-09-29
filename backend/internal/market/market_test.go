@@ -3,6 +3,7 @@ package market
 import (
 	"errors"
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -144,8 +145,40 @@ func TestSubmitPublishesEventsInOrder(t *testing.T) {
 			t.Fatalf("event %d carries symbol %q, want NOVA", i, got[i].Symbol)
 		}
 	}
-	if got[3].Book == nil || got[3].Book.Sequence != 2 {
-		t.Fatal("book_changed does not carry a snapshot stamped with the sequence")
+	// book_changed carries an incremental update, not a full snapshot: the ask level
+	// drained and a new bid level appeared for the remainder.
+	update := got[3].Update
+	if update == nil {
+		t.Fatal("book_changed carries no update")
+	}
+	if update.Sequence != 2 || update.Symbol != "NOVA" {
+		t.Fatalf("update is for %s at sequence %d, want NOVA at 2", update.Symbol, update.Sequence)
+	}
+	wantLevels := []engine.LevelChange{
+		{Side: engine.Buy, Price: 10000, Quantity: 60, Orders: 1},
+		{Side: engine.Sell, Price: 10000, Quantity: 0, Orders: 0},
+	}
+	if !reflect.DeepEqual(update.Levels, wantLevels) {
+		t.Fatalf("update levels are %+v, want %+v", update.Levels, wantLevels)
+	}
+	if len(update.Trades) != 1 || update.Trades[0].Quantity != 40 {
+		t.Fatalf("update carries trades %+v, want one fill of 40", update.Trades)
+	}
+	if !update.HasLastTrade || update.LastTradePrice != 10000 {
+		t.Fatalf("update reports last trade (%d, %v), want (10000, true)", update.LastTradePrice, update.HasLastTrade)
+	}
+}
+
+// TestUpdatesAreNotBuiltWhenNobodyIsListening keeps replay from paying for market data
+// it discards. A long session log is replayed command by command, and building a delta
+// per command would be pure overhead.
+func TestUpdatesAreNotBuiltWhenNobodyIsListening(t *testing.T) {
+	m := newTestMarket(t) // no sink
+	m.Apply(LimitOrder("maker", engine.Sell, 10000, 40))
+
+	// The engine's change record must have been dropped rather than left to grow.
+	if got := m.book.TakeLevelChanges(); len(got) != 0 {
+		t.Fatalf("level changes accumulated with no sink attached: %+v", got)
 	}
 }
 

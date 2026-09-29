@@ -56,6 +56,12 @@ type bookSide struct {
 	prices   priceHeap
 	nonEmpty int
 	resting  int
+	// touched records the prices changed by the command in progress, so incremental
+	// market data can be built without walking the whole side. See Book.TakeLevelChanges.
+	touched map[PriceTicks]struct{}
+	// touchedPeak is the largest touched has grown since it was allocated, which decides
+	// whether it is worth reusing. See resetTouched.
+	touchedPeak int
 }
 
 func newBookSide(side Side) *bookSide {
@@ -80,6 +86,7 @@ func (s *bookSide) push(o *Order) (*PriceLevel, *node) {
 	}
 	n := lvl.pushBack(o)
 	s.resting++
+	s.touch(o.LimitPrice)
 	return lvl, n
 }
 
@@ -87,6 +94,7 @@ func (s *bookSide) push(o *Order) (*PriceLevel, *node) {
 func (s *bookSide) remove(lvl *PriceLevel, n *node) {
 	lvl.remove(n)
 	s.resting--
+	s.touch(lvl.Price)
 	if lvl.Empty() {
 		s.nonEmpty--
 		s.maybeCompact()

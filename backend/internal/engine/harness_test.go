@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math/rand"
 	"testing"
 )
 
@@ -195,3 +196,7 @@ func (h *harness) dump() string {
 func level(price, qty int64, orders int) LevelView {
 	return LevelView{Price: PriceTicks(price), Quantity: qty, Orders: orders}
 }
+
+// newRand is a seeded PRNG, wrapped so the tests read the same way whichever file
+// they live in.
+func newRand(seed int64) *rand.Rand { return rand.New(rand.NewSource(seed)) }

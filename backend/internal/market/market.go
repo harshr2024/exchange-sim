@@ -24,6 +24,9 @@ type Market struct {
 	journal    Journal
 	sink       Sink
 	depth      int
+	// emits is false when nothing is listening, which lets the engine skip building
+	// incremental market data during replay.
+	emits bool
 
 	// seq is the exchange sequence counter. It is the sole source of order
 	// priority; no wall-clock time is involved.
@@ -44,7 +47,17 @@ type Option func(*Market)
 func WithJournal(j Journal) Option { return func(m *Market) { m.journal = j } }
 
 // WithSink publishes market data events to s.
-func WithSink(s Sink) Option { return func(m *Market) { m.sink = s } }
+//
+// Passing DiscardSink also switches off building the incremental updates in the first
+// place, which keeps replaying a long session log from paying for market data nobody is
+// listening to.
+func WithSink(s Sink) Option {
+	return func(m *Market) {
+		m.sink = s
+		_, discarding := s.(nopSink)
+		m.emits = !discarding
+	}
+}
 
 // WithDepth sets how many price levels per side published snapshots carry.
 func WithDepth(levels int) Option { return func(m *Market) { m.depth = levels } }
@@ -85,7 +98,7 @@ func (m *Market) Sequence() uint64 { return m.seq }
 // either side generated.
 func (m *Market) Apply(cmd Command) Ack {
 	if m.halted != nil {
-		return Ack{Sequence: m.seq, Rejection: fmt.Sprintf("%v: %v", ErrHalted, m.halted)}
+		return Ack{Sequence: m.seq, Rejection: fmt.Sprintf("%v: %v", ErrHalted, m.halted), Err: ErrHalted}
 	}
 
 	// Record before executing, and only consume the sequence number once the
@@ -96,14 +109,14 @@ func (m *Market) Apply(cmd Command) Ack {
 	if m.journal != nil {
 		if err := m.journal.Append(Record{Sequence: next, Command: cmd}); err != nil {
 			m.halted = err
-			return Ack{Sequence: m.seq, Rejection: fmt.Sprintf("%v: %v", ErrHalted, err)}
+			return Ack{Sequence: m.seq, Rejection: fmt.Sprintf("%v: %v", ErrHalted, err), Err: ErrHalted}
 		}
 	}
 	m.seq = next
 
 	if err := cmd.Validate(); err != nil {
 		m.reject(next, err)
-		return Ack{Sequence: next, Rejection: err.Error()}
+		return Ack{Sequence: next, Rejection: err.Error(), Err: err}
 	}
 
 	if cmd.Kind == Cancel {
@@ -143,7 +156,7 @@ func (m *Market) applySubmit(seq uint64, cmd Command) Ack {
 			Reason: "market order exhausted the opposite side",
 		})
 	}
-	m.publishBook(seq)
+	m.publishUpdate(seq, res.Trades)
 
 	return Ack{
 		Sequence:    seq,
@@ -161,17 +174,17 @@ func (m *Market) applyCancel(seq uint64, cmd Command) Ack {
 	// be able to pull another's quotes.
 	if existing, ok := m.book.Order(cmd.OrderID); ok && existing.ParticipantID != cmd.ParticipantID {
 		m.reject(seq, ErrNotOrderOwner)
-		return Ack{Sequence: seq, Rejection: ErrNotOrderOwner.Error()}
+		return Ack{Sequence: seq, Rejection: ErrNotOrderOwner.Error(), Err: ErrNotOrderOwner}
 	}
 
 	view, err := m.book.Cancel(cmd.OrderID)
 	if err != nil {
 		m.reject(seq, err)
-		return Ack{Sequence: seq, Rejection: err.Error()}
+		return Ack{Sequence: seq, Rejection: err.Error(), Err: err}
 	}
 
 	m.publish(Event{Kind: OrderCanceled, Sequence: seq, Order: &view, Reason: "canceled by participant"})
-	m.publishBook(seq)
+	m.publishUpdate(seq, nil)
 
 	return Ack{
 		Sequence:    seq,
@@ -191,10 +204,28 @@ func (m *Market) publish(e Event) {
 	m.sink.Publish(e)
 }
 
-func (m *Market) publishBook(seq uint64) {
-	snap := m.book.Snapshot(m.depth)
-	snap.Sequence = seq
-	m.publish(Event{Kind: BookChanged, Sequence: seq, Book: &snap})
+// publishUpdate emits the incremental market data for the command that just ran.
+//
+// The engine recorded which price levels it touched while matching, so this costs O(k)
+// in the levels that actually changed rather than O(L) in the levels on the book. When
+// nothing is listening the record is simply dropped.
+func (m *Market) publishUpdate(seq uint64, trades []engine.Trade) {
+	if !m.emits {
+		m.book.DiscardLevelChanges()
+		return
+	}
+
+	update := Update{
+		Symbol:   m.instrument.Symbol,
+		Sequence: seq,
+		Levels:   m.book.TakeLevelChanges(),
+		Trades:   trades,
+	}
+	update.BestBid, update.HasBestBid = m.book.BestBid()
+	update.BestAsk, update.HasBestAsk = m.book.BestAsk()
+	update.LastTradePrice, update.HasLastTrade = m.book.LastTradePrice()
+
+	m.publish(Event{Kind: BookChanged, Sequence: seq, Update: &update})
 }
 
 // Snapshot returns the published depth plus the derived quotes.

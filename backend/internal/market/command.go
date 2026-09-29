@@ -131,6 +131,10 @@ type Ack struct {
 	Accepted bool `json:"accepted"`
 	// Rejection explains a refusal, and is empty when Accepted is true.
 	Rejection string `json:"rejection,omitempty"`
+	// Err is the same refusal as a value, so callers can classify it with errors.Is
+	// instead of matching on the message. The API layer uses it to choose a status
+	// code. Not serialised: Rejection is the wire form.
+	Err error `json:"-"`
 
 	OrderID     engine.OrderID `json:"order_id,omitempty"`
 	Order       *engine.View   `json:"order,omitempty"`
