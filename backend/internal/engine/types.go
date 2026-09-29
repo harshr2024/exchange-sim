@@ -177,21 +177,66 @@ func (o *Order) Conserved() bool {
 	return o.OriginalQty == o.FilledQty+o.RemainingQty+o.CanceledQty
 }
 
+// OrderStatus is an order's lifecycle state.
+//
+// These are derived from the quantities the engine already tracks rather than stored, so
+// there is no separate state machine that could disagree with the book. The engine supports
+// exactly these four: it has no order types that can be pending, expired, replaced or
+// suspended.
+type OrderStatus string
+
+const (
+	// StatusOpen means resting with nothing executed.
+	StatusOpen OrderStatus = "open"
+	// StatusPartiallyFilled means resting with some quantity executed.
+	StatusPartiallyFilled OrderStatus = "partially_filled"
+	// StatusFilled is terminal: the whole order executed.
+	StatusFilled OrderStatus = "filled"
+	// StatusCanceled is terminal: the unexecuted remainder was withdrawn, either by the
+	// owner or because a market order ran out of liquidity.
+	StatusCanceled OrderStatus = "canceled"
+)
+
+// Terminal reports whether the order can still change.
+func (s OrderStatus) Terminal() bool { return s == StatusFilled || s == StatusCanceled }
+
+// Status derives the order's lifecycle state from its quantities.
+func (o *Order) Status() OrderStatus {
+	if o.RemainingQty > 0 {
+		if o.FilledQty > 0 {
+			return StatusPartiallyFilled
+		}
+		return StatusOpen
+	}
+	// Nothing left to trade. Cancellation is what distinguishes an order that gave up its
+	// remainder from one that executed in full, including the partially filled order whose
+	// rest was withdrawn.
+	if o.CanceledQty > 0 {
+		return StatusCanceled
+	}
+	return StatusFilled
+}
+
 // View is an immutable snapshot of an order, safe to hand to other goroutines.
 // The engine keeps mutating the *Order it owns, so events and API responses
 // always carry a View rather than a pointer.
 type View struct {
-	ID               OrderID    `json:"id"`
-	ParticipantID    string     `json:"participant"`
-	Symbol           string     `json:"symbol"`
-	Side             Side       `json:"side"`
-	Type             OrderType  `json:"type"`
-	LimitPrice       PriceTicks `json:"limit_price,omitempty"`
-	OriginalQty      int64      `json:"original_qty"`
-	RemainingQty     int64      `json:"remaining_qty"`
-	FilledQty        int64      `json:"filled_qty"`
-	CanceledQty      int64      `json:"canceled_qty"`
-	PrioritySequence uint64     `json:"priority_sequence"`
+	ID            OrderID    `json:"id"`
+	ParticipantID string     `json:"participant"`
+	Symbol        string     `json:"symbol"`
+	Side          Side       `json:"side"`
+	Type          OrderType  `json:"type"`
+	LimitPrice    PriceTicks `json:"limit_price,omitempty"`
+	OriginalQty   int64      `json:"original_qty"`
+	// RemainingQty is the leaves quantity: what is still working.
+	RemainingQty int64 `json:"remaining_qty"`
+	// FilledQty is cumulative across every execution this order has had.
+	FilledQty   int64 `json:"filled_qty"`
+	CanceledQty int64 `json:"canceled_qty"`
+	// Status is derived from the quantities above, so a client can render the order
+	// without inferring its state from the trade tape.
+	Status           OrderStatus `json:"status"`
+	PrioritySequence uint64      `json:"priority_sequence"`
 }
 
 // View copies the order into an immutable view.
@@ -207,6 +252,7 @@ func (o *Order) View() View {
 		RemainingQty:     o.RemainingQty,
 		FilledQty:        o.FilledQty,
 		CanceledQty:      o.CanceledQty,
+		Status:           o.Status(),
 		PrioritySequence: o.PrioritySequence,
 	}
 }

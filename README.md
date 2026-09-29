@@ -427,8 +427,19 @@ Full detail in [`docs/protocol.md`](docs/protocol.md). The three decisions worth
 each command touched, so an update carries only those. Broadcasting a full snapshot per
 command would make market data cost more than the matching underneath it — 139 µs against
 ~200 ns on a 2,000-level book. Snapshots stay an occasional synchronisation operation.
-Level quantities in an update are absolute rather than differences, so applying one twice is
-harmless and a client never tracks whether it already accounted for a fill.
+
+Level quantities are absolute rather than differences, which makes the **book-level portion**
+of an update idempotent: reapplying the same `levels` cannot double-count a fill into a price
+level. That is not a claim about the whole message — `trades` are individual executions, so
+reapplying one would print the same trade twice.
+
+**Order lifecycle covers the passive side.** An execution changes two orders, and the resting
+one's owner did nothing to cause it. So a resting order that gets filled produces an
+`order_filled` carrying its whole current state — cumulative filled, leaves quantity, and a
+status of `open`, `partially_filled`, `filled` or `canceled` derived from the quantities
+rather than stored. A client renders its orders from these directly instead of reconstructing
+them from the trade tape. The participant filter still applies, so a bot being filled stays
+off the human's stream entirely.
 
 **The client is given an identity, not asked for one.** There is no authentication and
 correspondingly no client-supplied participant: the request schema has no such field and
@@ -448,19 +459,25 @@ the worst part. The order is inverted instead:
 
 ```
 1. subscribe                    the hub queues from here on; nothing can be missed
-2. snapshot at sequence S       taken on the market's goroutine, so it covers exactly
-                                commands 1..S, whose updates are already queued
-3. send the snapshot
-4. forward the queue,           everything at or below S is already in the snapshot
-   discarding seq <= S
+2. read book + own orders       one query on the market's goroutine, so both describe
+   at sequence S                exactly commands 1..S, whose events are already queued
+3. send them as the snapshot
+4. forward the queue,           everything at or below S is already in the initial state,
+   discarding seq <= S          for the book and the client's own orders alike
 5. continue live
 ```
 
+The initial state covers the client's orders as well as the book, and both halves come from a
+single read of the market actor. Read separately they would describe two different sequences,
+and a fill landing between them would leave the client holding a pair of views that were never
+simultaneously true. Because they are consistent, discarding everything at or below S cannot
+lose the current state of any of the client's orders.
+
 Step 4 needs no catch-up phase and no boundary marker: messages leave the hub in sequence
 order, so once one passes `seq > S` every later one does, and the filter stops mattering by
-itself. If the subscriber is evicted at any point — including while the snapshot is being
-taken — messages were lost, so the server sends `resync` and closes rather than delivering
-what is on the far side of a gap.
+itself. If the subscriber is evicted at any point — including while the state is being read —
+messages were lost, so the server sends `resync` and closes rather than delivering what is on
+the far side of a gap.
 
 ---
 
@@ -468,7 +485,7 @@ what is on the far side of a gap.
 
 ```sh
 cd backend
-go test ./...              # 117 test functions, 166 cases including subtests
+go test ./...              # 127 test functions, 187 cases including subtests
 go test -race ./...        # the same suite under the race detector
 go test ./internal/engine/ -run '^$' -bench . -benchmem
 ```
@@ -555,6 +572,14 @@ seeded bots fed identical views decide identically.
 the API, participant-pinned cancellation ownership (403 for another participant, 404 for an
 order that is gone), refusal of a client-supplied participant, every malformed request shape,
 unknown symbols and order IDs, oversized bodies, and market isolation.
+
+**Order lifecycle.** A human order partially filled by a bot, fully filled by a bot, and
+filled repeatedly with cumulative quantities accumulating correctly; cancellation after a
+partial fill leaving the executed quantity intact and the status `canceled`; a bot being
+filled staying entirely off the human's stream; initial synchronisation carrying authoritative
+open orders while excluding bots' and already-canceled ones; and an order being ground down by
+continuous fills while clients reconnect repeatedly, checking no fill is lost across the
+synchronisation boundary.
 
 **Market data.** That a stream opens with a snapshot and then carries only deltas; that
 trades, level changes and quotes arrive; that a subscriber sees only its own order lifecycle;
@@ -717,10 +742,8 @@ Not oversights — decisions:
   live path, but it is still paid per WebSocket connection and per REST call, so a book with
   thousands of levels would make reconnection expensive. Top-K selection instead of a full
   sort would fix it without touching the book's data structures.
-- **No execution reports for passive fills.** When a bot fills the human's resting order, no
-  order message is emitted for the human: the engine reports lifecycle events for the
-  incoming order only. A client can detect it from the order IDs in the streamed trades, or
-  refetch its open orders. A real venue would send both sides an execution report.
+- **No cancel/replace, so no priority-reset semantics** to reason about. Lifecycle covers only
+  the four states this engine can produce.
 - **No self-trade prevention.** The market maker avoids matching its own quotes by never
   crossing, but nothing in the engine would stop it.
 - **The bots are not a market model.** They generate plausible-looking activity. Nothing

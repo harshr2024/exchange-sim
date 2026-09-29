@@ -102,11 +102,24 @@ Every frame is JSON with a `type` and the market `seq` it belongs to.
 ### `snapshot`
 
 Sent once when the stream opens, and again never — a second snapshot only arrives on a new
-connection. Carries the same body as `GET /snapshot`.
+connection. It is the client's complete initial state: the book **and** the subscriber's own
+resting orders, both as of the same sequence.
 
 ```json
-{"type":"snapshot","symbol":"NOVA","seq":37,"book":{ "...": "top 10 levels per side" }}
+{"type":"snapshot","symbol":"NOVA","seq":37,
+ "book":{ "...": "top 10 levels per side" },
+ "orders":[{"id":30,"participant":"human","side":"buy","type":"limit","limit_price":9990,
+            "original_qty":100,"filled_qty":40,"remaining_qty":60,"canceled_qty":0,
+            "status":"partially_filled","priority_sequence":12}]}
 ```
+
+The two halves come from **one read of the market actor**, not a snapshot call plus a separate
+REST request. Read separately they would describe two different sequences, and a fill landing
+between them would leave the client holding a book and an order list that were never
+simultaneously true — with no sequence it could safely discard from.
+
+On reconnect this is authoritative and replaces whatever the client was holding. An order
+absent from `orders` is no longer working.
 
 ### `update`
 
@@ -123,27 +136,58 @@ Incremental market data for one command. This is the live path.
 ```
 
 **Level quantities are absolute, not differences.** `quantity` is what rests at that price
-now; `0` means the level is gone and should be dropped. Absolute values make an update
-idempotent, so applying one twice is harmless and a client never has to track whether it has
-already accounted for a fill.
+now; `0` means the level is gone and should be dropped.
 
-Updates carrying no levels and no trades are not sent, because there would be nothing to
-learn from one.
+This makes the **book-level portion** of an update idempotent: applying the same `levels`
+array twice leaves the client's book in the same state, so no fill can be double-counted into
+a price level.
+
+It does **not** make the update as a whole idempotent. `trades` are individual executions, not
+state — reapplying a message would print the same trade on the tape twice. A client that
+reapplies one must take `levels` and skip `trades`, which is why every message carries the
+sequence it belongs to.
+
+Updates carrying no levels and no trades are not sent, because there would be nothing to learn
+from one.
 
 ### `order`
 
-A lifecycle change to one of *the subscriber's own* orders — `order_accepted`,
-`order_rested`, `order_canceled`. The bots generate most of the order churn on a live market
-and none of it is a client's business, so only the configured participant's orders reach the
-wire.
+A lifecycle change to one of *the subscriber's own* orders. The bots generate most of the order
+churn on a live market and none of it is a client's business, so only the configured
+participant's orders reach the wire — including when a bot is the one being filled.
 
 ```json
-{"type":"order","symbol":"NOVA","seq":38,"event":"order_rested",
- "order":{"id":30,"participant":"human","remaining_qty":40, "...": "..."}}
+{"type":"order","symbol":"NOVA","seq":52,"event":"order_filled",
+ "order":{"id":30,"participant":"human","symbol":"NOVA","side":"buy","type":"limit",
+          "limit_price":9990,"original_qty":100,"filled_qty":40,"remaining_qty":60,
+          "canceled_qty":0,"status":"partially_filled","priority_sequence":37}}
 ```
 
-Rejections are not streamed: they carry no order, so they cannot be attributed to a
-participant. The HTTP response to the rejected command reports it instead.
+| `event` | Raised when |
+| --- | --- |
+| `order_accepted` | A submitted order was sequenced; carries its state after any immediate fills |
+| `order_rested` | An unfilled remainder joined the book |
+| `order_filled` | A resting order was executed against by someone else's incoming order |
+| `order_canceled` | An order was withdrawn, or a market order gave up its remainder |
+
+`order_filled` is what an order's owner receives when it is on the **passive** side of a trade.
+An execution changes two orders, and the passive side did nothing to cause it; without this
+event the only evidence would be a trade carrying the order's ID, leaving the owner to
+reconstruct quantities from the tape.
+
+The payload is the order's **whole current state**, not a diff:
+
+- `filled_qty` is cumulative across every execution the order has had.
+- `remaining_qty` is the leaves quantity: what is still working.
+- `status` is one of `open`, `partially_filled`, `filled`, `canceled`. It is derived from the
+  quantities rather than stored, so it cannot disagree with the book, and those four are the
+  only states an engine with no pending, expired or replaced orders can produce. `filled` and
+  `canceled` are terminal.
+- An order that traded and was then withdrawn is `canceled` with its `filled_qty` intact; the
+  executions are not undone.
+
+Because the payload is complete state, order messages *are* idempotent: applying one twice is
+harmless, and a client can simply keep the one with the highest sequence.
 
 ### `error`
 
@@ -168,13 +212,17 @@ So the order is inverted:
 
 ```
 1. subscribe                     the hub starts queueing immediately; nothing can be missed
-2. snapshot at sequence S        taken on the market's goroutine, so it reflects exactly
-                                 commands 1..S, and updates for those are already queued
-3. send the snapshot
-4. forward queued messages,      the snapshot already accounts for everything up to S
-   discarding seq <= S
+2. read the book and the         one query on the market's goroutine, so both describe
+   client's own orders at S      exactly commands 1..S, whose events are already queued
+3. send them as the snapshot
+4. forward queued messages,      the initial state already accounts for everything up to S,
+   discarding seq <= S           for the book and the client's own orders alike
 5. continue live
 ```
+
+Because the initial state covers the client's own orders as well as the book, discarding
+everything at or below S cannot lose the current state of any of them — which is exactly what
+a snapshot carrying only the book would have risked.
 
 Step 4 needs no separate catch-up phase and no boundary marker. Messages leave the hub in
 sequence order, because they are published from the market's own goroutine, so once one

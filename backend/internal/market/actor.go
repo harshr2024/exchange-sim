@@ -163,6 +163,15 @@ func (a *Actor) OpenOrders(ctx context.Context, participant string) ([]engine.Vi
 	return query(ctx, a, func(m *Market) []engine.View { return m.OpenOrders(participant) })
 }
 
+// SyncState returns the book and participant's open orders as of a single market sequence.
+//
+// One query, so both halves are read on the market's goroutine between the same pair of
+// commands. Two separate calls could straddle a fill and hand back a book and an order list
+// that were never true at the same time.
+func (a *Actor) SyncState(ctx context.Context, participant string) (SyncState, error) {
+	return query(ctx, a, func(m *Market) SyncState { return m.SyncState(participant) })
+}
+
 // RecentTrades returns the last n trades, oldest first.
 func (a *Actor) RecentTrades(ctx context.Context, n int) ([]engine.Trade, error) {
 	return query(ctx, a, func(m *Market) []engine.Trade { return m.RecentTrades(n) })

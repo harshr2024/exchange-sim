@@ -39,6 +39,9 @@ type Message struct {
 
 	// Book is set on TypeSnapshot.
 	Book *engine.BookSnapshot `json:"book,omitempty"`
+	// Orders is set on TypeSnapshot: the subscriber's own resting orders, authoritative
+	// as of Sequence. On reconnect they replace whatever the client was holding.
+	Orders []engine.View `json:"orders,omitempty"`
 	// Update is set on TypeUpdate.
 	Update *market.Update `json:"update,omitempty"`
 	// Order and Event are set on TypeOrder.
@@ -49,9 +52,20 @@ type Message struct {
 	Resync bool   `json:"resync,omitempty"`
 }
 
-// SnapshotMessage wraps a book snapshot.
-func SnapshotMessage(snap engine.BookSnapshot) Message {
-	return Message{Type: TypeSnapshot, Symbol: snap.Symbol, Sequence: snap.Sequence, Book: &snap}
+// SnapshotMessage wraps the initial synchronisation state.
+//
+// The book and the orders come from one read of the market, so they describe the same
+// sequence. That is what lets a client discard every queued message at or below it without
+// risking the current state of one of its own orders.
+func SnapshotMessage(state market.SyncState) Message {
+	book := state.Book
+	return Message{
+		Type:     TypeSnapshot,
+		Symbol:   book.Symbol,
+		Sequence: state.Sequence,
+		Book:     &book,
+		Orders:   state.Orders,
+	}
 }
 
 // UpdateMessage wraps incremental market data.

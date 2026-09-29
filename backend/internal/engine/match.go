@@ -11,6 +11,17 @@ type Result struct {
 	// CanceledQty is the quantity given up rather than rested. This is non-zero
 	// only for a market order that exhausted the opposite side.
 	CanceledQty int64
+	// Filled is the post-execution state of each resting order this one traded against,
+	// in the order they were hit.
+	//
+	// An execution changes two orders, and the passive side's owner needs to be told
+	// about it as much as the aggressor's does. Without this, the only evidence that a
+	// resting order had been filled would be a trade carrying its ID, leaving the owner
+	// to reconstruct quantities from the tape.
+	//
+	// Each resting order appears at most once: a fill either exhausts it, in which case
+	// it leaves the book, or exhausts the incoming order, in which case matching stops.
+	Filled []View
 }
 
 // Submit runs one order through the book.
@@ -23,9 +34,9 @@ type Result struct {
 // Submit takes ownership of o and mutates it. The caller should read the returned
 // View rather than keeping the pointer.
 func (b *Book) Submit(o *Order) Result {
-	trades := b.match(o)
+	trades, filled := b.match(o)
 
-	res := Result{Trades: trades}
+	res := Result{Trades: trades, Filled: filled}
 	if o.RemainingQty > 0 {
 		switch o.Type {
 		case Market:
@@ -46,10 +57,14 @@ func (b *Book) Submit(o *Order) Result {
 
 // match consumes resting liquidity on the opposite side until the order is
 // filled, the book is exhausted, or the next price is outside the order's limit.
-func (b *Book) match(o *Order) []Trade {
+//
+// It returns the executions and the post-execution state of every resting order it
+// touched.
+func (b *Book) match(o *Order) ([]Trade, []View) {
 	opp := b.sideFor(o.Side.Opposite())
 
 	var trades []Trade
+	var filled []View
 	for o.RemainingQty > 0 {
 		lvl := opp.bestLevel()
 		if lvl == nil {
@@ -76,9 +91,13 @@ func (b *Book) match(o *Order) []Trade {
 				opp.remove(lvl, n)
 				delete(b.index, resting.ID)
 			}
+
+			// Captured after the fill, so it is the resting order's new state rather
+			// than the one it had a moment ago.
+			filled = append(filled, resting.View())
 		}
 	}
-	return trades
+	return trades, filled
 }
 
 // recordTrade mints a trade for one fill and advances the last traded price.

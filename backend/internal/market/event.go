@@ -14,6 +14,10 @@ const (
 	OrderRejected EventKind = "order_rejected"
 	OrderRested   EventKind = "order_rested"
 	OrderCanceled EventKind = "order_canceled"
+	// OrderFilled reports the new state of a resting order that an incoming order
+	// executed against. The aggressor's own state arrives on OrderAccepted; this is how
+	// the passive side's owner hears about it.
+	OrderFilled   EventKind = "order_filled"
 	TradeExecuted EventKind = "trade_executed"
 	BookChanged   EventKind = "book_changed"
 )

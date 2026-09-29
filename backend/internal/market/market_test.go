@@ -130,7 +130,9 @@ func TestSubmitPublishesEventsInOrder(t *testing.T) {
 	m.Apply(LimitOrder("taker", engine.Buy, 10000, 100))
 
 	got := rec.Events()[before:]
-	want := []EventKind{OrderAccepted, TradeExecuted, OrderRested, BookChanged}
+	// order_filled reports the maker's resting order after the execution, so its owner
+	// does not have to infer the new quantities from the trade.
+	want := []EventKind{OrderAccepted, TradeExecuted, OrderFilled, OrderRested, BookChanged}
 	if len(got) != len(want) {
 		t.Fatalf("published %d events, want %d: %v", len(got), len(want), kinds(got))
 	}
@@ -145,9 +147,21 @@ func TestSubmitPublishesEventsInOrder(t *testing.T) {
 			t.Fatalf("event %d carries symbol %q, want NOVA", i, got[i].Symbol)
 		}
 	}
+	// The maker's order was fully consumed, and the event says so outright.
+	passive := got[2].Order
+	if passive == nil {
+		t.Fatal("order_filled carries no order")
+	}
+	if passive.ParticipantID != "maker" || passive.FilledQty != 40 || passive.RemainingQty != 0 {
+		t.Fatalf("passive order is %+v, want maker's order fully filled", passive)
+	}
+	if passive.Status != engine.StatusFilled {
+		t.Fatalf("passive order status is %q, want %q", passive.Status, engine.StatusFilled)
+	}
+
 	// book_changed carries an incremental update, not a full snapshot: the ask level
 	// drained and a new bid level appeared for the remainder.
-	update := got[3].Update
+	update := got[4].Update
 	if update == nil {
 		t.Fatal("book_changed carries no update")
 	}

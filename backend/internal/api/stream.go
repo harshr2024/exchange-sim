@@ -70,26 +70,28 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	sub := hub.Subscribe(s.cfg.SubscriberQueue)
 	defer hub.Unsubscribe(sub)
 
-	// Step 2: snapshot. Everything up to snap.Sequence is in it; everything after is
-	// already queued.
-	snap, err := actor.Snapshot(ctx)
+	// Step 2: read the book and this client's own open orders together, in one query, so
+	// both describe the same sequence S. Reading them separately would let a fill land
+	// between the two, leaving the client with a pair of views that were never
+	// simultaneously true and no safe sequence to discard from.
+	state, err := actor.SyncState(ctx, s.cfg.Participant)
 	if err != nil {
 		s.closeStream(ctx, conn, sub, "market is unavailable", false)
 		return
 	}
 	if !sub.Alive() {
-		// The queue overflowed while the snapshot was being taken, so updates after it
-		// are already lost. Continuing would produce a view with a silent gap.
+		// The queue overflowed while the state was being read, so updates after it are
+		// already lost. Continuing would produce a view with a silent gap.
 		s.closeStream(ctx, conn, sub, sub.Reason(), true)
 		return
 	}
 
-	if err := s.write(ctx, conn, feed.SnapshotMessage(snap)); err != nil {
+	if err := s.write(ctx, conn, feed.SnapshotMessage(state)); err != nil {
 		return
 	}
 
-	// Step 3: forward everything newer than the snapshot.
-	s.pump(ctx, conn, sub, snap.Sequence)
+	// Step 3: forward everything newer than the synchronised state.
+	s.pump(ctx, conn, sub, state.Sequence)
 }
 
 // pump forwards messages until the client leaves, the subscription dies, or a write fails.

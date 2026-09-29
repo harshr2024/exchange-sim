@@ -147,6 +147,12 @@ func (m *Market) applySubmit(seq uint64, cmd Command) Ack {
 		trade := res.Trades[i]
 		m.publish(Event{Kind: TradeExecuted, Sequence: seq, Trade: &trade})
 	}
+	// Each resting order this one executed against, so its owner learns the new state
+	// rather than having to reconstruct it from the trades.
+	for i := range res.Filled {
+		passive := res.Filled[i]
+		m.publish(Event{Kind: OrderFilled, Sequence: seq, Order: &passive})
+	}
 	switch {
 	case res.Rested:
 		m.publish(Event{Kind: OrderRested, Sequence: seq, Order: &accepted})
@@ -239,6 +245,37 @@ func (m *Market) Snapshot() engine.BookSnapshot {
 // participant returns every resting order.
 func (m *Market) OpenOrders(participant string) []engine.View {
 	return m.book.OpenOrders(participant)
+}
+
+// SyncState is everything a client needs to start from scratch, all of it as of one market
+// sequence.
+type SyncState struct {
+	// Sequence is the market sequence this state describes. Every event at or below it is
+	// already accounted for here.
+	Sequence uint64 `json:"sequence"`
+	// Book is the published depth.
+	Book engine.BookSnapshot `json:"book"`
+	// Orders are the requesting participant's resting orders, authoritative as of
+	// Sequence. On reconnect these replace whatever the client had.
+	Orders []engine.View `json:"orders"`
+}
+
+// SyncState captures the book and participant's open orders together.
+//
+// Together is the point. Fetching the book and the orders separately would read them at two
+// different sequences, and a fill landing between the two reads would leave the client with
+// a book and an order list that never coexisted — with no way to tell which events it could
+// safely discard. Taken here, both describe the same instant.
+func (m *Market) SyncState(participant string) SyncState {
+	orders := m.book.OpenOrders(participant)
+	if orders == nil {
+		orders = []engine.View{}
+	}
+	return SyncState{
+		Sequence: m.seq,
+		Book:     m.Snapshot(),
+		Orders:   orders,
+	}
 }
 
 // RecentTrades returns the last n trades, oldest first. A n of 0 or less returns

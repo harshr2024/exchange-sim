@@ -192,7 +192,10 @@ func (b *Broadcaster) Publish(e market.Event) {
 		}
 		b.hub.Publish(UpdateMessage(*e.Update))
 
-	case market.OrderAccepted, market.OrderRested, market.OrderCanceled:
+	case market.OrderAccepted, market.OrderRested, market.OrderCanceled, market.OrderFilled:
+		// OrderFilled is how a subscriber hears that one of its resting orders was
+		// executed against by someone else. The participant filter still applies, so a
+		// bot being filled stays entirely off this client's stream.
 		if b.participant == "" || e.Order == nil || e.Order.ParticipantID != b.participant {
 			return
 		}
