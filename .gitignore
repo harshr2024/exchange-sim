@@ -1,0 +1,16 @@
+# Build output
+/backend/bin/
+/backend/dist/
+
+# Session replay logs produced at runtime
+*.ndjson
+
+# Go test/profile artifacts
+*.test
+*.out
+*.prof
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
