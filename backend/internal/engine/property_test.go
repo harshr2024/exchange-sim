@@ -103,6 +103,83 @@ func TestRandomFlowHoldsEveryInvariant(t *testing.T) {
 	}
 }
 
+// TestStaleLevelsStayBounded checks the memory bound of the lazy discard scheme.
+//
+// Drained levels are kept until they surface at the heap root or a compaction runs,
+// which is what keeps the heap and the level map describing the same price set without
+// a separate membership structure. The bound on what that costs is:
+//
+//	stale <= max(compactThreshold, live)
+//
+// where stale is the levels held with nothing in them. The reasoning: stale can only
+// grow when a level empties, and every such event runs maybeCompact, which either
+// rebuilds (leaving stale at 0) or establishes stale < live. Below the threshold no
+// rebuild happens, so stale can reach compactThreshold-1 instead. Pushes never
+// increase stale, because a new price adds to both counts and a refill adds only to
+// live. So the last emptying event caps stale for as long as the side keeps growing.
+//
+// That is a weaker bound than "twice the live levels", which is what this test was
+// first written to assert. It failed: a side that drops below the threshold can
+// accumulate up to 31 stale levels, and then grow past the threshold carrying them,
+// which reached seven times the live count here. The bound below is the corrected one.
+func TestStaleLevelsStayBounded(t *testing.T) {
+	for _, seed := range []int64{2, 8, 64} {
+		t.Run("", func(t *testing.T) {
+			rng := rand.New(rand.NewSource(seed))
+			h := newHarness(t)
+
+			var resting []OrderID
+			worst := 0.0
+
+			for i := 0; i < 6000; i++ {
+				side := Buy
+				if rng.Intn(2) == 0 {
+					side = Sell
+				}
+				qty := int64(1 + rng.Intn(40))
+
+				switch {
+				case len(resting) > 0 && rng.Intn(100) < 35:
+					pick := rng.Intn(len(resting))
+					id := resting[pick]
+					resting = append(resting[:pick], resting[pick+1:]...)
+					_ = h.cancel(id)
+				case rng.Intn(100) < 20:
+					h.market("noise", side, qty)
+				default:
+					// A wide price range so many distinct levels get touched and
+					// drained, which is the case the bound is about.
+					price := PriceTicks(10000 + rng.Intn(401) - 200)
+					id, res := h.limit("noise", side, price, qty)
+					if res.Rested {
+						resting = append(resting, id)
+					}
+				}
+
+				for _, s := range []*bookSide{h.book.bids, h.book.asks} {
+					held, live := len(s.levels), s.nonEmpty
+					stale := held - live
+
+					limit := max(live, compactThreshold)
+					if stale > limit {
+						t.Fatalf("%s side holds %d stale levels alongside %d live ones after %d commands, bound is %d",
+							s.side, stale, live, i+1, limit)
+					}
+					if live > 0 {
+						if ratio := float64(held) / float64(live); ratio > worst {
+							worst = ratio
+						}
+					}
+				}
+			}
+			// Reported rather than asserted: the ratio is unbounded for a nearly empty
+			// side, since 31 stale levels beside one live one is 31x and still within
+			// the bound. What is bounded is the stale count, which is what costs memory.
+			t.Logf("seed %d: worst held-to-live level ratio %.2f", seed, worst)
+		})
+	}
+}
+
 // TestDrainedLevelsAreReclaimed checks that repeatedly creating and emptying
 // levels does not grow the book's internal price bookkeeping without bound.
 //

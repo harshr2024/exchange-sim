@@ -29,13 +29,87 @@ market-data protocols and regulatory rules that are not here. See
 | 1 | Limit order book, FIFO levels, matching, sweeps | done |
 | 2 | Market orders, cancellation, snapshots, invariants, benchmarks | done |
 | 3 | Market actor, sequencing, session log, deterministic replay | done |
-| 4 | Simulated traders (market maker, noise trader) | not started |
+| 4 | Simulated traders and terminal simulation | done |
 | 5 | HTTP order entry and WebSocket market data | not started |
 | 6 | React + TypeScript trading screen | not started |
 | 7 | Polish and documentation | not started |
 
-The backend is complete and tested through phase 3. There is no frontend yet; use
-`cmd/session` to drive a market from a terminal.
+The backend is complete and tested through phase 4. There is no frontend and no
+network layer yet; the exchange runs from a terminal.
+
+---
+
+## The claim, demonstrated
+
+This is the part of the project worth looking at first.
+
+```
+concurrent submissions          (HTTP clients, bots, several goroutines)
+        │
+        ▼
+one sequenced command stream    (the market actor assigns the total order)
+        │
+        ▼
+market execution                (price-time priority matching)
+        │
+        ▼
+recorded session                (append-only NDJSON command log)
+        │
+        ▼
+fresh engine replay             (a new book, fed only the log)
+        │
+        ▼
+identical canonical SHA-256 digest
+```
+
+The digest covers every price level, every resting order's ID, owner, priority
+sequence and quantities, and the entire trade history — so two markets cannot match
+on it without being genuinely identical, down to which resting order is next in line.
+
+```sh
+cd backend
+go run ./cmd/simulate -ticks 400 -seed 7 -session-dir /tmp/sessions
+```
+
+```
+-- summary ------------------------------------------------------
+  ticks          400
+  commands       310 (310 accepted, 0 rejected)
+  trades         102 (1262 shares)
+-- replay -------------------------------------------------------
+  session log    /tmp/sessions/session-NOVA.ndjson (310 commands)
+  live digest    3c7c1e9733231580a4ce36f28f9eb374c0f1c922ca72d1face6245d6a7922369
+  replay digest  3c7c1e9733231580a4ce36f28f9eb374c0f1c922ca72d1face6245d6a7922369
+  result         identical: same trades, same book, same order priorities
+```
+
+### Two different guarantees
+
+The distinction between these matters more than it looks:
+
+| Runner | Reproducible from | Why |
+| --- | --- | --- |
+| `sim.Driver` (`-mode deterministic`) | **its seeds** | One goroutine polls bots in a fixed order, so no scheduling decision enters the command stream. |
+| `sim.Live` (`-mode live`) | **its recorded log** | Bot goroutines race to reach the market; which arrives first is the Go scheduler's choice, not the seed's. |
+
+Empirically, running each mode twice with the same seed:
+
+```
+deterministic, seed 7, twice:
+  live digest    7a503843c544dea4714a2596f44cb3b27aba84ed2f8a6ea3d6eaa6f9deeb6fa3
+  live digest    7a503843c544dea4714a2596f44cb3b27aba84ed2f8a6ea3d6eaa6f9deeb6fa3   <- same
+
+live, seed 7, twice:
+  live digest    94590dbe3ea1adb15087de28c6b675d6c1a60e96faf05096e3052a753fccd7ea
+  replay digest  94590dbe3ea1adb15087de28c6b675d6c1a60e96faf05096e3052a753fccd7ea   <- replays
+  live digest    7247330ccb094d3d83bb2b6ec0899775248a8351e7f3313aab550c03c0317977   <- differs
+  replay digest  7247330ccb094d3d83bb2b6ec0899775248a8351e7f3313aab550c03c0317977   <- replays
+```
+
+Demanding that two concurrent runs match on seed alone would be asserting something
+untrue about goroutine scheduling. What the design actually guarantees is that the
+actor converts a nondeterministic arrival race into one specific total order, and that
+once that order exists, execution is deterministic.
 
 ---
 
@@ -46,20 +120,21 @@ Requires Go 1.24 or later.
 ```sh
 cd backend
 
-# Run a scripted session and prove it replays.
+# Autonomous market: bots trade, then the session is replayed and verified.
+go run ./cmd/simulate -ticks 400 -seed 7 -print-every 200
+go run ./cmd/simulate -mode live -duration 3s
+
+# A scripted human session: partial fill, cancel, multi-level sweep.
 go run ./cmd/session -session-dir /tmp/sessions
 
-# Rebuild that market from its log.
+# Rebuild any market from its log.
 go run ./cmd/replay -file /tmp/sessions/session-NOVA.ndjson
 
 # Boot the exchange (health endpoint and instrument listing only, so far).
 go run ./cmd/exchanged
 ```
 
-`cmd/session` seeds a book, submits a limit order that partially fills, cancels the
-remainder, then sends a market order that sweeps several levels — printing the book,
-the tape and the open orders after each step. It finishes by replaying its own
-session log into a fresh engine and comparing digests:
+`cmd/session` prints the book, tape and open orders after each step:
 
 ```
 -- human buys 50 at 100.10: fills 30, rests 20 ------------------
@@ -73,11 +148,6 @@ NOVA  Nova Dynamics   seq 7   last 100.10   spread 0.10
       100.10       20       1   bid
        99.90       40       1   bid
        99.80       70       1   bid
-
--- replay -------------------------------------------------------
-  live digest    562ed7e43b3b310b500fffc368bed985239cb452867b7462c0294e660bc4bd60
-  replay digest  562ed7e43b3b310b500fffc368bed985239cb452867b7462c0294e660bc4bd60
-  result         identical: same trades, same book, same order priorities
 ```
 
 ---
@@ -126,11 +196,16 @@ market's own goroutine rather than by locking the book.
 | --- | --- |
 | `internal/engine` | The order book and matching. Generic over symbol, no concurrency, no I/O. |
 | `internal/market` | Sequencing, validation, the session log, event publication, the actor, replay. |
+| `internal/sim` | The simulated traders and the two runners that schedule them. |
 | `internal/instrument` | The listed fictional securities and tick-to-decimal formatting. |
 | `internal/display` | Plain-text rendering for the command-line tools. |
 | `cmd/exchanged` | The server. |
-| `cmd/session` | Drives a scripted session and verifies it replays. |
+| `cmd/simulate` | Runs a market autonomously with the bots, then verifies replay. |
+| `cmd/session` | Drives a scripted human session and verifies it replays. |
 | `cmd/replay` | Rebuilds a market from a session log. |
+
+Further reading: [`docs/order-book-internals.md`](docs/order-book-internals.md) covers
+the hybrid map-plus-heap design and the lazy stale-level scheme in detail.
 
 ---
 
@@ -272,6 +347,59 @@ Consequences worth being explicit about:
   refetches a REST snapshot rather than replaying a gap.
 - **Bots** use `TryEnqueue`, which reports a full queue instead of waiting. A quoting
   bot that blocked would only pile up updates that are stale by the time they run.
+- **Abandoned reads.** A query whose caller gives up on a canceled context is still run
+  by the actor, so its result comes back over a buffered channel rather than a variable
+  the closure captured. An earlier version captured, which the race detector caught once
+  bots began reading the book on an expiring context; `TestAbandonedQueriesDoNotRace` is
+  the regression test.
+
+---
+
+## Simulated traders
+
+Two bots, in `internal/sim`. They exist to make the exchange demonstrable, not to study
+market dynamics.
+
+**Bots are decision functions, not goroutines.** A `Bot` receives an immutable `View`
+and returns the commands it wants to submit. It holds no reference to the book, the
+market or the actor, so it submits through exactly the same command interface as a human
+and cannot mutate matching state even by accident. Choosing *when* to consult a bot is
+the runner's job, which is what makes the same bot usable in both the reproducible and
+the concurrent runner.
+
+**Ownership is unexpressible, not just refused.** A bot's `View` carries only its own
+resting orders, and the aggregated book carries no order identities at all — so a bot
+has no way to *name* another participant's order. The market enforces ownership too, and
+both runners refuse to submit a command a bot attributed to someone else, but the
+structural argument is the one that matters. `TestBotsOnlyCancelTheirOwnOrders`
+reconstructs ownership from the recorded command stream and checks every cancel against
+it.
+
+**The market maker** maintains a ladder of quotes around the reference price, cancelling
+and replacing a quote once it leaves the ladder or falls below half its target size.
+That is the whole strategy: no inventory model, no skew, no learning. It shifts its
+whole ladder rather than crossing, so it never takes liquidity — and since there is no
+self-trade prevention yet, that also stops it matching its own quote.
+`TestMakerDoesNotTakeLiquidity` runs it alone against resting liquidity and asserts zero
+trades.
+
+**The noise trader** produces flow from a seeded PRNG: mostly market and marketable
+limit orders, sometimes passive orders spread over a few ticks behind the touch,
+occasionally a cancel. It has no view of value and no opinion about direction.
+
+**The reference price is read, never written.** Both bots derive it from market state —
+mid, then last trade, then whichever side exists — falling back to the instrument's
+bootstrap price only for a market that has never traded and has nothing resting. It
+never becomes the displayed price: the last price moves when a trade prints and at no
+other time, which is what keeps the quoted price a product of activity in this market.
+`TestMakerQuotesBothSidesOfAnEmptyBook` asserts the book has a spread while the last
+price is still unset.
+
+**What counts as a legitimate rejection.** A cancel that misses because the order was
+filled a moment earlier is expected, especially under the live runner. A malformed
+command is a bug. `TestBotCommandsAreAlwaysValid` distinguishes them: every recorded
+command must pass validation, and the only rejection reason permitted is the engine's
+unknown-order error.
 
 ---
 
@@ -279,7 +407,7 @@ Consequences worth being explicit about:
 
 ```sh
 cd backend
-go test ./...              # 51 test functions, 77 cases including subtests
+go test ./...              # 74 test functions, 107 cases including subtests
 go test -race ./...        # the same suite under the race detector
 go test ./internal/engine/ -run '^$' -bench . -benchmem
 ```
@@ -292,20 +420,41 @@ that corrupts the order index or lets a level total drift from its queue is usua
 invisible in the result of the command that caused it and only surfaces several
 commands later, by which point the cause is gone.
 
-`Book.CheckInvariants` verifies, and reports all violations together:
+The invariants come in **two classes**, and the distinction is worth keeping straight
+because only one of them is a statement about exchanges.
 
-- the resting book is never crossed (`bestBid < bestAsk` whenever both exist)
+`CheckSemanticInvariants` — properties any correct continuous limit order book must
+hold, whatever it is built out of. These would still be required if the whole data
+structure were replaced with a balanced tree or a sorted slice:
+
+- the resting book is never crossed, and no bid level sits at or above any ask level
 - every resting order has `remainingQty > 0`
 - every order conserves quantity: `original == filled + remaining + canceled`
-- every `PriceLevel.TotalQty` equals the sum of its orders' remaining quantities
-- the FIFO queue's links are consistent in both directions and its count is right
-- within a level, priority sequences strictly increase
-- every resting order has exactly one index entry pointing at its actual node and
-  level; filled and canceled orders have none
-- the heap's price set equals the level map's key set, with no duplicates
+- every level's advertised `TotalQty` is exactly what rests there, so published depth
+  is truthful
+- within a price, priority sequences strictly increase, oldest at the front
+- order IDs are unique among live orders, and every live order is addressable by ID
+  while nothing else is
+- an order rests on the side and at the price it asked for, and a market order never
+  rests at all
 
-Trades are validated as they happen: positive quantity, never more than either
-order's pre-trade remaining quantity, and always at the resting order's limit price.
+`CheckImplementationInvariants` — properties of *this* design, which are how the code
+keeps the promises above. A different design would have entirely different ones:
+
+- the heap's price set equals the level map's key set, with no duplicates
+- each order index locator points at the exact node and level holding that order
+- the FIFO queue's links agree in both directions and its cached count is right
+- the cached `nonEmpty` and `resting` counters match reality, since compaction
+  depends on them
+
+`TestInvariantClassesCatchDifferentFaults` keeps the split honest by corrupting state
+deliberately and checking that each class detects faults the other misses: a bad cached
+counter trips only the implementation check, a quantity that does not conserve or a
+crossed book trips only the semantic one.
+
+Trades are validated as they happen — positive quantity, never more than either order's
+pre-trade remaining quantity, always at the resting order's limit price — which is a
+semantic check.
 
 **Worked examples.** Empty book, exact fill, partial passive fill, partial aggressive
 fill, multi-level sweep, FIFO within a level, price priority beating time priority,
@@ -335,6 +484,12 @@ next in line; they cannot agree on this digest without being identical.
 `TestDigestDetectsADifferentOrdering` guards the guard, by checking that the same
 commands in a different order produce a different digest.
 
+**Bot behaviour.** That bots cannot name another participant's order, that every command
+they emit validates, that the market maker never takes liquidity and shifts its ladder
+rather than crossing, that it replaces depleted quotes but leaves healthy ones alone,
+that the noise trader never fires a market order into an empty book, and that identically
+seeded bots fed identical views decide identically.
+
 **Concurrency.** Sixteen goroutines submit 4,000 commands into one market actor. The
 test asserts that sequence numbers form the dense range `1..N` with no gaps and no
 duplicates, that each goroutine's own submissions are monotonic, that all invariants
@@ -358,27 +513,61 @@ program is race-free.
 
 ## Benchmarks
 
-### Methodology
+Benchmarks cover the matching engine alone: no channels, no journal, no serialisation.
+No throughput target was set; these are measurements, and none of them is a headline.
 
-Benchmarks cover the matching engine alone: no channels, no journal, no
-serialisation. None of them pause the timer to set up a book, because stopping and
-starting the timer around a few hundred nanoseconds of work costs more than the work
-itself. Instead each one times a self-contained unit and documents what that unit
-includes.
+All figures: Apple M3, 8 cores, macOS 26.6, Go 1.27.1.
 
-That means **these figures are not subtractable from one another.** They differ in
-how large the book is while the work happens, and book size is the main thing the
-engine's cost depends on. `BenchmarkSubmitAndCancel` comes out *faster* per command
-than `BenchmarkSubmitPassiveLimit` for exactly that reason: it withdraws every order
-it places, so its book stays near-empty, while the other's grows to millions of
-resting orders. Compare a benchmark against itself across changes, not against its
-neighbours.
+### Scaling with book depth
 
-No throughput target was set. These are measurements.
+These are the ones worth reading. Book depth is held constant for the whole run, so
+"how does this behave as the book gets deeper?" has an actual answer. Each pairs an
+operation with its inverse — an insert with a cancel, a fill with a replacement — so
+depth never drifts, which means the reported `ns/op` is the cost of the pair and the
+interesting figure is how it moves across depths.
 
-### Measured
+```
+                                    1k resting   10k resting   100k resting
+insert + cancel                       116 ns       144 ns        153 ns
+resting order + fill that takes it     167 ns       208 ns        212 ns
+read best bid and best ask             9.9 ns       9.9 ns        9.8 ns
+```
 
-Apple M3, 8 cores, macOS 26.6, Go 1.27.1, `-benchtime 1s`:
+- **Mutation is close to flat**: 100× the depth costs about 30% more per operation, and
+  that residue is cache and allocator behaviour rather than algorithmic. This is what
+  the order index and the level map are for.
+- **Best-price reads are flat at ~10 ns and allocation-free**, which is the property the
+  whole lazy stale-level scheme exists to protect. If this ever grew with depth, it
+  would mean drained levels were accumulating faster than they are reclaimed.
+
+### The one that does not scale
+
+Publishing depth costs more than matching does, and superlinearly in the number of
+distinct prices:
+
+```
+                        20 levels   200 levels   2000 levels
+snapshot top 10/side      507 ns      6.4 µs       133 µs
+```
+
+`Snapshot` collects every live level, sorts them, then keeps ten. That is O(L log L)
+per call, and a `book_changed` event fires on **every command**, so at 2,000 distinct
+prices market data would cost roughly 600× what the matching underneath it costs.
+
+It is not a current problem — the running simulation holds a few dozen levels, where a
+snapshot is around 1 µs — but it is a real scaling cliff and the strongest argument
+against the map-plus-heap choice. The fixes, in increasing order of effort: select the
+top ten instead of sorting all of them; publish deltas rather than full snapshots;
+or maintain the book in an ordered structure where traversal is already cheap. This is
+work for the network-layer phase, not something to guess at now.
+
+### Self-contained units
+
+These each time one unit of work and document what that unit includes. Because they
+differ in how large the book is while the work happens, **they are not subtractable
+from one another** — `SubmitAndCancel` comes out faster per command than
+`SubmitPassiveLimit` purely because it withdraws every order it places while the other
+grows to five million resting orders. Compare each against itself across changes.
 
 ```
 BenchmarkSubmitPassiveLimit-8    5158771     246.2 ns/op    202 B/op     3 allocs/op   5158771 resting
@@ -389,21 +578,16 @@ BenchmarkMixedFlow-8             6471408     208.0 ns/op    218 B/op     3 alloc
 BenchmarkLargeWorkload-8              69   16764572 ns/op                             100000 commands/op
 ```
 
-Reading these:
+`BenchmarkLargeWorkload` runs 100,000 generated commands through a fresh book in about
+16.8 ms, which works out to roughly 6 million commands per second. That number needs a
+caveat attached whenever it is quoted: it is one synthetic stream, on one core, with no
+sequencing, no journal write, no event publication and no network, against a book of a
+few dozen price levels. It is a useful floor on what the matching core can do and not a
+claim about the exchange.
 
-- A passive insert into a book that has grown to five million resting orders costs
-  about 246 ns, and that includes the order index rehashing and the collector's view
-  of every live order. This is the pessimistic end of insertion cost.
-- One resting order plus the aggressive order that fully consumes it is about 133 ns
-  for the pair.
-- Ten inserts plus the market order that sweeps all ten levels is about 1.9 µs, so
-  roughly 91 ns per command on the expensive matching path.
-- The 100,000-command mixed workload runs in about 16.8 ms end to end, which is
-  around 6.0 million commands per second, producing about 88,500 trades.
-
-Allocation counts are reported but not yet optimised. Each command allocates an
-`Order`, and matching allocates the trade slice it returns. The obvious next step
-would be to profile before changing anything, which has not been done.
+Allocation counts are reported but not optimised: every command allocates an `Order`,
+and matching allocates the trade slice it returns. Profiling comes before changing any
+of that, and has not been done.
 
 ---
 
@@ -440,8 +624,13 @@ Not oversights — decisions:
 - **Trade history is unbounded.** A market keeps every trade of its session in memory
   so replay can be verified against the whole history. Fine for a demo, not for a
   long-running process.
-- **`book_changed` carries a full snapshot**, not a delta. Deltas are an optimisation
-  for later.
+- **`book_changed` carries a full snapshot**, not a delta, and building one is
+  superlinear in the number of distinct prices. See the benchmark section: this is the
+  clearest scaling weakness in the current design.
+- **No self-trade prevention.** The market maker avoids matching its own quotes by never
+  crossing, but nothing in the engine would stop it.
+- **The bots are not a market model.** They generate plausible-looking activity. Nothing
+  about the resulting price series should be read as meaningful.
 
 ---
 

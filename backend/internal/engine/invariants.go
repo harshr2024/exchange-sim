@@ -5,35 +5,159 @@ import (
 	"fmt"
 )
 
-// CheckInvariants verifies every structural property the book is supposed to hold
-// after a command finishes. It returns all violations it finds, joined, so a
-// failing test reports the whole picture rather than the first symptom.
+// The book's invariants come in two classes, and the distinction is worth keeping
+// straight.
 //
-// These properties matter more than any individual matching example: most of the
-// bugs worth fearing here (a stale index entry, a level total that drifted from
-// its queue, liquidity left unmatched) show up as an invariant violation long
-// before they show up as an obviously wrong trade.
+// Semantic invariants are properties any correct continuous limit order book must
+// hold, whatever it is built out of. "The resting book is never crossed" and "a
+// trade never fills more than either order had left" are statements about what an
+// exchange means, and they would still be required if the whole data structure were
+// replaced with a balanced tree or a flat sorted slice.
+//
+// Implementation invariants are properties of this particular design: that the price
+// heap and the level map describe the same set of prices, that the order index
+// locator points at the node it claims to, that the cached counters match reality.
+// They are how *this* code keeps its semantic promises, and a different design would
+// have entirely different ones.
+//
+// Both are worth testing. Only the first class is worth describing as an exchange
+// invariant.
+
+// CheckInvariants verifies both classes and returns every violation it finds, joined,
+// so a failure reports the whole picture rather than the first symptom.
 func (b *Book) CheckInvariants() error {
+	return errors.Join(b.CheckSemanticInvariants(), b.CheckImplementationInvariants())
+}
+
+// CheckSemanticInvariants verifies the properties a correct order book must hold
+// regardless of how it is built.
+//
+// These matter more than any individual matching example. Most of the bugs worth
+// fearing here surface as a violation of one of these long before they surface as an
+// obviously wrong trade.
+func (b *Book) CheckSemanticInvariants() error {
 	var problems []error
 	add := func(format string, args ...any) {
 		problems = append(problems, fmt.Errorf(format, args...))
 	}
 
-	// No crossed resting book. If the best bid is at or above the best ask, the
-	// engine failed to execute liquidity that was available to it.
+	// The resting book is never crossed. A best bid at or above the best ask means
+	// the engine failed to execute liquidity that was available to it.
 	bid, hasBid := b.BestBid()
 	ask, hasAsk := b.BestAsk()
 	if hasBid && hasAsk && bid >= ask {
 		add("crossed book: best bid %d >= best ask %d", bid, ask)
 	}
 
+	// Order IDs are unique among live orders, so an ID names at most one thing.
+	seenIDs := make(map[OrderID]PriceTicks)
+
+	for _, side := range []*bookSide{b.bids, b.asks} {
+		name := side.side.String()
+
+		for price, lvl := range side.levels {
+			var sum int64
+			var prevSeq uint64
+			for n := lvl.head; n != nil; n = n.next {
+				o := n.order
+				sum += o.RemainingQty
+
+				// A resting order always has something left to trade.
+				if o.RemainingQty <= 0 {
+					add("%s %d: order %d rests with remaining qty %d", name, price, o.ID, o.RemainingQty)
+				}
+
+				// Quantity is conserved: nothing is created or lost.
+				if !o.Conserved() {
+					add("order %d does not conserve quantity: original %d != filled %d + remaining %d + canceled %d",
+						o.ID, o.OriginalQty, o.FilledQty, o.RemainingQty, o.CanceledQty)
+				}
+
+				// An order rests on the side and at the price it asked for.
+				if o.Side != side.side {
+					add("%s %d: order %d has side %s", name, price, o.ID, o.Side)
+				}
+				if o.Type == Limit && o.LimitPrice != price {
+					add("%s %d: order %d has limit price %d", name, price, o.ID, o.LimitPrice)
+				}
+
+				// A market order has no price, so it can never rest.
+				if o.Type == Market {
+					add("%s %d: market order %d is resting", name, price, o.ID)
+				}
+
+				// Time priority within a price level: strictly increasing sequence,
+				// oldest at the front. This is the half of price-time priority that
+				// a queue bug would silently break.
+				if prevSeq != 0 && prevSeq >= o.PrioritySequence {
+					add("%s %d: order %d (seq %d) is queued behind sequence %d",
+						name, price, o.ID, o.PrioritySequence, prevSeq)
+				}
+				prevSeq = o.PrioritySequence
+
+				if at, dup := seenIDs[o.ID]; dup {
+					add("order %d rests at both %d and %d", o.ID, at, price)
+				}
+				seenIDs[o.ID] = price
+			}
+
+			// Published depth is truthful: a level's advertised quantity is exactly
+			// what is resting there.
+			if sum != lvl.TotalQty {
+				add("%s %d: level advertises %d but holds %d", name, price, lvl.TotalQty, sum)
+			}
+		}
+	}
+
+	// Price priority across levels: every bid is below every ask. The crossed-book
+	// check above covers the touch; this covers the whole book.
+	if hasBid && hasAsk {
+		for price, lvl := range b.bids.levels {
+			if !lvl.Empty() && price >= ask {
+				add("bid level %d is at or above the best ask %d", price, ask)
+			}
+		}
+		for price, lvl := range b.asks.levels {
+			if !lvl.Empty() && price <= bid {
+				add("ask level %d is at or below the best bid %d", price, bid)
+			}
+		}
+	}
+
+	// Every live order is addressable by ID, and nothing else is.
+	for id := range seenIDs {
+		if _, ok := b.index[id]; !ok {
+			add("order %d rests on the book but cannot be looked up by id", id)
+		}
+	}
+	if len(b.index) != len(seenIDs) {
+		add("%d orders are addressable by id but %d rest on the book", len(b.index), len(seenIDs))
+	}
+
+	return errors.Join(problems...)
+}
+
+// CheckImplementationInvariants verifies the bookkeeping this particular design
+// relies on: the heap and level map agreeing, the order index locators pointing where
+// they claim, the linked lists being intact and the cached counters being accurate.
+//
+// A violation here is not by itself a wrong answer to a client, but it is how wrong
+// answers start.
+func (b *Book) CheckImplementationInvariants() error {
+	var problems []error
+	add := func(format string, args ...any) {
+		problems = append(problems, fmt.Errorf(format, args...))
+	}
+
 	indexed := 0
 	for _, side := range []*bookSide{b.bids, b.asks} {
 		name := side.side.String()
 
-		// The price heap and the level map must describe the same set of prices.
+		// The price heap and the level map must describe exactly the same set of
+		// prices, with no duplicates. This is what lets drained levels be discarded
+		// lazily without a separate membership set.
 		if side.prices.Len() != len(side.levels) {
-			add("%s: heap has %d prices but map has %d levels", name, side.prices.Len(), len(side.levels))
+			add("%s: heap holds %d prices but the map holds %d levels", name, side.prices.Len(), len(side.levels))
 		}
 		seen := make(map[PriceTicks]bool, side.prices.Len())
 		for _, price := range side.prices.prices {
@@ -60,36 +184,17 @@ func (b *Book) CheckInvariants() error {
 				nonEmpty++
 			}
 
-			var sum int64
 			count := 0
 			for n := lvl.head; n != nil; n = n.next {
 				o := n.order
 				count++
-				sum += o.RemainingQty
 
-				if o.RemainingQty <= 0 {
-					add("%s %d: order %d rests with remaining qty %d", name, price, o.ID, o.RemainingQty)
-				}
-				if !o.Conserved() {
-					add("order %d does not conserve quantity: original %d != filled %d + remaining %d + canceled %d",
-						o.ID, o.OriginalQty, o.FilledQty, o.RemainingQty, o.CanceledQty)
-				}
-				if o.Side != side.side {
-					add("%s %d: order %d has side %s", name, price, o.ID, o.Side)
-				}
-				if o.Type == Limit && o.LimitPrice != price {
-					add("%s %d: order %d has limit price %d", name, price, o.ID, o.LimitPrice)
-				}
-				if o.Type == Market {
-					add("%s %d: market order %d is resting", name, price, o.ID)
-				}
-
-				// Every resting order needs exactly one index entry, and that
-				// entry must point back at this node in this level.
+				// The order index must point at this exact node in this exact level,
+				// which is what makes cancellation an unlink rather than a search.
 				loc, ok := b.index[o.ID]
 				switch {
 				case !ok:
-					add("order %d rests at %s %d but is not indexed", o.ID, name, price)
+					add("order %d rests at %s %d but has no index entry", o.ID, name, price)
 				case loc.node != n:
 					add("order %d is indexed to a different node", o.ID)
 				case loc.level != lvl:
@@ -98,9 +203,12 @@ func (b *Book) CheckInvariants() error {
 					add("order %d is indexed on side %s but rests on %s", o.ID, loc.side, name)
 				}
 
-				// FIFO links must be consistent in both directions.
+				// The FIFO queue's links agree in both directions.
 				if n.next != nil && n.next.prev != n {
 					add("%s %d: broken forward link after order %d", name, price, o.ID)
+				}
+				if n.prev != nil && n.prev.next != n {
+					add("%s %d: broken backward link before order %d", name, price, o.ID)
 				}
 				if n.prev == nil && lvl.head != n {
 					add("%s %d: order %d has no predecessor but is not the head", name, price, o.ID)
@@ -108,24 +216,17 @@ func (b *Book) CheckInvariants() error {
 				if n.next == nil && lvl.tail != n {
 					add("%s %d: order %d has no successor but is not the tail", name, price, o.ID)
 				}
-
-				// Priority within a level must be strictly increasing by sequence.
-				if n.prev != nil && n.prev.order.PrioritySequence >= o.PrioritySequence {
-					add("%s %d: order %d (seq %d) queued behind order %d (seq %d)",
-						name, price, o.ID, o.PrioritySequence, n.prev.order.ID, n.prev.order.PrioritySequence)
-				}
 			}
 
 			if count != lvl.count {
 				add("%s %d: level counts %d orders but its queue holds %d", name, price, lvl.count, count)
 			}
-			if sum != lvl.TotalQty {
-				add("%s %d: level total %d != sum of remaining quantities %d", name, price, lvl.TotalQty, sum)
-			}
 			resting += count
 			indexed += count
 		}
 
+		// The cached counters that drive compaction must match reality, or levels
+		// will be reclaimed at the wrong time.
 		if nonEmpty != side.nonEmpty {
 			add("%s: tracks %d non-empty levels but has %d", name, side.nonEmpty, nonEmpty)
 		}
@@ -134,7 +235,6 @@ func (b *Book) CheckInvariants() error {
 		}
 	}
 
-	// No index entry may point at an order that is not resting.
 	if indexed != len(b.index) {
 		add("index holds %d entries but %d orders rest on the book", len(b.index), indexed)
 	}
@@ -143,7 +243,8 @@ func (b *Book) CheckInvariants() error {
 }
 
 // CheckTrade verifies a trade against the remaining quantities its two orders had
-// before it executed.
+// before it executed. This is a semantic check: an execution may never create
+// quantity that was not there to trade.
 func CheckTrade(t Trade, aggressorPre, restingPre int64) error {
 	var problems []error
 	if t.Quantity <= 0 {
