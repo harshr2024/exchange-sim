@@ -119,79 +119,74 @@ func (a *Actor) TryEnqueue(cmd Command) error {
 	}
 }
 
-// query runs fn on the market's own goroutine and waits for it to finish, which is
-// how read access stays race-free without putting a lock on the matching path.
-func (a *Actor) query(ctx context.Context, fn func(*Market)) error {
-	done := make(chan struct{})
-	wrapped := func(m *Market) {
-		fn(m)
-		close(done)
+// query runs fn on the market's own goroutine and returns its result, which is how
+// read access stays race-free without putting a lock on the matching path.
+//
+// The result comes back through a buffered channel rather than a variable the
+// closure captures. That matters for abandonment: if the caller gives up on a
+// canceled context after the closure is already queued, the actor will still run it,
+// and a captured variable would then be written by the actor while the caller was
+// reading it. Handing the value back over a channel with room for it means the actor
+// never blocks and an abandoned result is simply never read.
+//
+// It is a free function rather than a method because Go does not allow methods to
+// introduce their own type parameters.
+func query[T any](ctx context.Context, a *Actor, fn func(*Market) T) (T, error) {
+	var zero T
+	reply := make(chan T, 1)
+
+	select {
+	case a.queries <- func(m *Market) { reply <- fn(m) }:
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	case <-a.stopped:
+		return zero, ErrStopped
 	}
 
 	select {
-	case a.queries <- wrapped:
+	case v := <-reply:
+		return v, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return zero, ctx.Err()
 	case <-a.stopped:
-		return ErrStopped
-	}
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-a.stopped:
-		return ErrStopped
+		return zero, ErrStopped
 	}
 }
 
 // Snapshot returns the current published book.
 func (a *Actor) Snapshot(ctx context.Context) (engine.BookSnapshot, error) {
-	var snap engine.BookSnapshot
-	err := a.query(ctx, func(m *Market) { snap = m.Snapshot() })
-	return snap, err
+	return query(ctx, a, func(m *Market) engine.BookSnapshot { return m.Snapshot() })
 }
 
 // OpenOrders returns participant's resting orders.
 func (a *Actor) OpenOrders(ctx context.Context, participant string) ([]engine.View, error) {
-	var out []engine.View
-	err := a.query(ctx, func(m *Market) { out = m.OpenOrders(participant) })
-	return out, err
+	return query(ctx, a, func(m *Market) []engine.View { return m.OpenOrders(participant) })
 }
 
 // RecentTrades returns the last n trades, oldest first.
 func (a *Actor) RecentTrades(ctx context.Context, n int) ([]engine.Trade, error) {
-	var out []engine.Trade
-	err := a.query(ctx, func(m *Market) { out = m.RecentTrades(n) })
-	return out, err
+	return query(ctx, a, func(m *Market) []engine.Trade { return m.RecentTrades(n) })
 }
 
 // Sequence returns the market's current sequence number.
 func (a *Actor) Sequence(ctx context.Context) (uint64, error) {
-	var seq uint64
-	err := a.query(ctx, func(m *Market) { seq = m.Sequence() })
-	return seq, err
+	return query(ctx, a, func(m *Market) uint64 { return m.Sequence() })
 }
 
 // Digest returns a digest of the market's full canonical state.
 func (a *Actor) Digest(ctx context.Context) (string, error) {
-	var digest string
-	err := a.query(ctx, func(m *Market) { digest = m.Digest() })
-	return digest, err
+	return query(ctx, a, func(m *Market) string { return m.Digest() })
 }
 
 // CanonicalState returns the market's full canonical state as text.
 func (a *Actor) CanonicalState(ctx context.Context) (string, error) {
-	var state string
-	err := a.query(ctx, func(m *Market) { state = m.CanonicalState() })
-	return state, err
+	return query(ctx, a, func(m *Market) string { return m.CanonicalState() })
 }
 
 // CheckInvariants runs the market's invariant checks on the owning goroutine.
 func (a *Actor) CheckInvariants(ctx context.Context) error {
-	var invErr error
-	if err := a.query(ctx, func(m *Market) { invErr = m.CheckInvariants() }); err != nil {
+	invErr, err := query(ctx, a, func(m *Market) error { return m.CheckInvariants() })
+	if err != nil {
 		return err
 	}
 	return invErr

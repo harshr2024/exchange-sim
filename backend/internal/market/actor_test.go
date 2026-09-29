@@ -248,6 +248,54 @@ func TestSubmitAfterShutdownFails(t *testing.T) {
 	}
 }
 
+// TestAbandonedQueriesDoNotRace covers a defect the race detector found once the
+// simulated traders started reading the book on a context that expires: a query
+// whose caller gives up after the closure is already queued.
+//
+// The actor still runs that closure. An earlier version had it write its result into
+// a variable the caller had captured, so the actor wrote while the caller read. The
+// result now comes back over a buffered channel, so an abandoned query is harmless.
+// This test is only meaningful under -race.
+func TestAbandonedQueriesDoNotRace(t *testing.T) {
+	actor := startActor(t, newTestMarket(t), 8)
+
+	if _, err := actor.Submit(context.Background(), LimitOrder("human", engine.Buy, 9990, 10)); err != nil {
+		t.Fatalf("seeding an order: %v", err)
+	}
+
+	// An already-canceled context means the second select in query can take the
+	// cancellation branch even though the closure was accepted, which is exactly the
+	// abandonment case. Looping makes the interleaving happen rather than hoping.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				// Every read path, since each one used to capture its own variable.
+				_, _ = actor.Snapshot(canceled)
+				_, _ = actor.OpenOrders(canceled, "human")
+				_, _ = actor.RecentTrades(canceled, 10)
+				_, _ = actor.Sequence(canceled)
+				_, _ = actor.Digest(canceled)
+				_ = actor.CheckInvariants(canceled)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The market must still be healthy and readable afterwards.
+	if err := actor.CheckInvariants(context.Background()); err != nil {
+		t.Fatalf("invariant violation: %v", err)
+	}
+	if open, err := actor.OpenOrders(context.Background(), "human"); err != nil || len(open) != 1 {
+		t.Fatalf("market is not readable after abandoned queries: %v, %d orders", err, len(open))
+	}
+}
+
 func TestSubmitHonoursContextCancellation(t *testing.T) {
 	// Not started, and the queue is full, so the submit has nowhere to go.
 	actor := NewActor(newTestMarket(t), 1)
