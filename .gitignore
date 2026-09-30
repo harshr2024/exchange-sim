@@ -1,6 +1,8 @@
 # Build output
 /backend/bin/
 /backend/dist/
+/frontend/node_modules/
+/frontend/dist/
 
 # Session replay logs produced at runtime
 *.ndjson
